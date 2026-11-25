@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.7
+// @version      0.5.8
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -820,6 +820,12 @@
   let floatingBar = null;
   let brightness = 1; // remembered between fullscreen sessions on this page
 
+  // Sites where our HLS player couldn't play the stream: go straight to the site's player there.
+  const FAIL_KEY = 'videoGestures.ownFailed';
+  const ownFailedHere = () => { try { return localStorage.getItem(FAIL_KEY) === '1'; } catch (_) { return false; } };
+  const markOwnFailed = () => { try { localStorage.setItem(FAIL_KEY, '1'); } catch (_) {} };
+  const clearOwnFailed = () => { try { localStorage.removeItem(FAIL_KEY); } catch (_) {} };
+
   function mountOverlay(container, source, opts = {}) {
     if (overlay && overlay.container === container && overlay.source === source) return;
     teardownOverlay();
@@ -832,10 +838,11 @@
     const hlsJs = !!(HlsLib && HlsLib.isSupported && HlsLib.isSupported());
     // In Firefox's content-script sandbox hls.js mixes page and sandbox objects and Firefox
     // blocks it (black screen), so there HLS goes to the site's player unless Firefox plays it natively.
-    const hlsBlocked = !!src && src.kind === 'hls' && sandboxed && !canNativeHls();
+    const hlsBlocked = !!src && src.kind === 'hls' && ((sandboxed && !canNativeHls()) || (ownFailedHere() && !opts.retryOwn));
     const direct = !!src && (src.kind === 'file' || (src.kind === 'hls' && !hlsBlocked && (hlsJs || canNativeHls())));
-    if (hlsBlocked && !opts.notice) opts = Object.assign({}, opts, {
-      notice: "Own player can't run here", why: 'Firefox sandboxed the script (page CSP)' });
+    if (hlsBlocked && !opts.notice) opts = Object.assign({}, opts, sandboxed
+      ? { notice: "Own player can't run here", why: 'Firefox sandboxed the script (page CSP)' }
+      : { notice: 'Our player failed on this site before', why: 'tap the tag to retry' });
     const video = direct ? h('video', { class: 'own', playsinline: '', preload: 'auto' }) : source;
     let hls = null;
 
@@ -929,6 +936,7 @@
       // site's player), fall back to guarding the site's own video.
       const fallBack = (why) => {
         if (!overlay || overlay.video !== video) return;
+        if (src.kind === 'hls' && !firstFrame) markOwnFailed();
         teardownOverlay();
         mountOverlay(container, source, { noDirect: true, notice: "Couldn't play the stream in our player", why: why || lastErr });
       };
@@ -961,6 +969,9 @@
             if (!errLog.includes(e)) errLog.push(e);
             lastErr = errLog.slice(-3).join(' → ');
             if (!firstFrame) showBubble(null, 'Loading stream…', { sub: `${lastErr}${worker ? '' : ' [no worker]'}`, sticky: true });
+            // Can't parse this site's segments (custom scrambling only its own player undoes):
+            // waiting won't help, hand over now.
+            if (!firstFrame && d.details === 'fragParsingError') { fallBack(lastErr); return; }
             if (!d.fatal) return;
             if (d.type === HlsLib.ErrorTypes.MEDIA_ERROR && !recovered) { recovered = true; hls.recoverMediaError(); return; }
             fallBack(lastErr);
@@ -1057,7 +1068,7 @@
     modeTag.addEventListener('click', () => {
       teardownOverlay();
       if (direct) mountOverlay(container, source, { noDirect: true, notice: "Switched to the site's player" });
-      else mountOverlay(container, source);
+      else { clearOwnFailed(); mountOverlay(container, source, { retryOwn: true }); }
     }, sig);
 
     const togglePlay = () => { if (video.paused) play(); else pause(); };
