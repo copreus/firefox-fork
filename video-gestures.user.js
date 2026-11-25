@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.3
+// @version      0.5.4
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -24,6 +24,10 @@
   // so the site never sees (or picks up) a second hls.js.
   const HlsLib = W.Hls || (typeof Hls !== 'undefined' ? Hls : null); // eslint-disable-line no-undef
   if (HlsLib && W.Hls === HlsLib) { try { delete W.Hls; } catch (_) {} }
+  // Running in Firefox's content-script sandbox (the manager couldn't inject into the page)?
+  // Then hls.js's worker messages arrive as page objects that hls.js can't write to, so it
+  // fails with "Not allowed to define cross-origin object as property". Run it without the worker.
+  const sandboxed = W !== window;
   const canNativeHls = () => !!document.createElement('video').canPlayType('application/vnd.apple.mpegurl');
 
   // ------------------------------------------------------------------ config
@@ -749,10 +753,12 @@
       position: absolute; left: 50%; top: 22%; transform: translateX(-50%);
       display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 14px;
       background: rgba(0,0,0,.62); font-weight: 600; font-size: 16px; white-space: nowrap;
+      flex-wrap: wrap; justify-content: center; max-width: 88vw; box-sizing: border-box; text-align: center;
       opacity: 0; transition: opacity .15s; pointer-events: none;
     }
     .bubble.show { opacity: 1; }
-    .bubble .sub { opacity: .75; font-weight: 500; font-size: 14px; white-space: normal; max-width: 70vw; overflow-wrap: anywhere; }
+    .bubble .sub:empty { display: none; }
+    .bubble .sub { opacity: .75; font-weight: 500; font-size: 14px; white-space: normal; flex: 1 1 100%; min-width: min(72vw, 380px); overflow-wrap: anywhere; }
     .meter { width: 120px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.3); overflow: hidden; }
     .meter > i { display: block; height: 100%; background: #fff; width: 0; }
     .ripple { position: absolute; top: 0; bottom: 0; width: 38%; display: flex; align-items: center; justify-content: center;
@@ -901,7 +907,7 @@
         fallBack(e ? `media error ${e.code}${e.message ? `: ${e.message}` : ''}` : 'media error');
       }, sig);
       if (src.kind === 'hls' && hlsJs) {
-        hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined });
+        hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined, enableWorker: !sandboxed });
         let recovered = false;
         hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
         hls.on(HlsLib.Events.ERROR, (_, d) => {
