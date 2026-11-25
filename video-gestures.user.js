@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.3.0
+// @version      0.4.0
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
 // @grant        none
@@ -74,6 +74,7 @@
     mute: 'M3 9v6h4l5 5V4L7 9H3zm13.6 3 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4z',
     sun: 'M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10zM2 13h2v-2H2v2zm18 0h2v-2h-2v2zM11 2v2h2V2h-2zm0 18v2h2v-2h-2zM5.99 4.58 4.58 5.99l1.42 1.41 1.41-1.41zM18 16.6l-1.41 1.41L18 19.42 19.42 18zM19.42 6 18 4.58 16.59 6 18 7.41zM7.41 18 6 16.59 4.58 18 6 19.42z',
     fast: 'M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z',
+    rotate: 'M16.48 2.52c3.27 1.55 5.61 4.72 5.97 8.48h1.5C23.44 4.84 18.29 0 12 0l-.66.03 3.81 3.81 1.33-1.32zm-6.25-.77c-.59-.59-1.54-.59-2.12 0L1.75 8.11c-.59.59-.59 1.54 0 2.12l12.02 12.02c.59.59 1.54.59 2.12 0l6.36-6.36c.59-.59.59-1.54 0-2.12L10.23 1.75zm4.6 19.44L2.81 9.17l6.36-6.36 12.02 12.02-6.36 6.36zm-7.31.29C4.25 19.94 1.91 16.76 1.55 13H.05C.56 19.16 5.71 24 12 24l.66-.03-3.81-3.81-1.33 1.32z',
   };
 
   // ------------------------------------------------------------------ fullscreen plumbing
@@ -420,6 +421,7 @@
 
     const title = h('div', { class: 'title' }, document.title || '');
     const speedBtn = h('button', { title: 'Speed' }, '1×');
+    const rotateBtn = h('button', { title: 'Rotate screen' }, icon(ICON.rotate));
     const exitBtn = h('button', { title: 'Exit fullscreen' }, icon(ICON.exitFs));
     const playBtn = h('button', { class: 'big', title: 'Play/pause' }, icon(ICON.play, 36));
     const backBtn = h('button', { class: 'skip' }, `−${SKIP}`);
@@ -432,7 +434,7 @@
     const track = h('div', { class: 'track' }, h('div', { class: 'rail' }, buf, fill, knob));
     const hud = h('div', { class: 'hud' },
       h('div', { class: 'shade' }),
-      h('div', { class: 'top' }, title, speedBtn, exitBtn),
+      h('div', { class: 'top' }, title, speedBtn, rotateBtn, exitBtn),
       h('div', { class: 'mid' }, backBtn, playBtn, fwdBtn),
       h('div', { class: 'bottom' }, cur, track, dur));
 
@@ -650,15 +652,27 @@
     layer.addEventListener('pointerup', endGesture, sig);
     layer.addEventListener('pointercancel', endGesture, sig);
 
-    // --- orientation: landscape for wide videos
+    // --- orientation: landscape for wide videos, until the user picks one with the rotate button
+    let manualOrientation = false;
     function lockOrientation() {
       try {
-        if (!video.videoWidth) return;
+        if (manualOrientation || !video.videoWidth) return;
         const want = video.videoWidth >= video.videoHeight ? 'landscape' : 'portrait';
         screen.orientation.lock(want).catch(() => {});
       } catch (_) {}
     }
     lockOrientation();
+    rotateBtn.addEventListener('click', () => {
+      showHud();
+      const now = (screen.orientation && screen.orientation.type) || (innerWidth > innerHeight ? 'landscape' : 'portrait');
+      const want = now.startsWith('landscape') ? 'portrait' : 'landscape';
+      manualOrientation = true;
+      let p;
+      try { p = screen.orientation.lock(want); } catch (e) { p = Promise.reject(e); }
+      Promise.resolve(p).then(
+        () => showBubble(ICON.rotate, want === 'landscape' ? 'Landscape' : 'Portrait'),
+        () => showBubble(ICON.rotate, "Can't rotate here", { sub: 'browser blocked it' }));
+    }, sig);
     video.addEventListener('loadedmetadata', lockOrientation, sig);
 
     // Some sites swap the <video> element (ad -> show, quality change). Follow the playing one.

@@ -29,6 +29,8 @@ pieces (no single file), the script keeps the site's video but ignores any pause
 | Press and hold | 2× speed while held |
 | Single tap | Show / hide controls |
 
+The top bar has speed, **rotate** (switch between landscape and portrait) and exit buttons.
+
 ## Limits
 - Volume is the video's own volume, and brightness can only dim (real system volume/brightness needs a Firefox fork).
 - In fullscreen, everything but the video is hidden — including the site's own captions (captions built into the video file still show).
