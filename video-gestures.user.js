@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.0
+// @version      0.5.1
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -490,6 +490,39 @@
     return u8;
   }
 
+  // hls.js fragment loader that runs stripJunk on each segment, so disguised streams play
+  // in our player too. Skipped for encrypted segments (strip after decrypting isn't possible
+  // here) and for fMP4 (no TS sync bytes to look for).
+  let JunkStripLoader = null;
+  function junkStripLoader() {
+    if (JunkStripLoader || !HlsLib) return JunkStripLoader;
+    const Base = HlsLib.DefaultConfig.loader;
+    JunkStripLoader = class extends Base {
+      load(context, config, callbacks) {
+        const onSuccess = callbacks.onSuccess;
+        const frag = context.frag;
+        const encrypted = frag && frag.decryptdata && frag.decryptdata.method && frag.decryptdata.method !== 'NONE';
+        const init = frag && frag.sn === 'initSegment';
+        super.load(context, config, Object.assign({}, callbacks, {
+          onSuccess(response, stats, ctx, details) {
+            try {
+              if (!encrypted && !init && response.data instanceof ArrayBuffer) {
+                const u8 = new Uint8Array(response.data);
+                const box = u8.length > 8 ? String.fromCharCode(u8[4], u8[5], u8[6], u8[7]) : '';
+                if (!/^(ftyp|styp|moof|sidx|emsg)$/.test(box)) {
+                  const s = stripJunk(u8);
+                  if (s !== u8) response.data = s.slice().buffer;
+                }
+              }
+            } catch (_) {}
+            onSuccess(response, stats, ctx, details);
+          },
+        }));
+      }
+    };
+    return JunkStripLoader;
+  }
+
   function segExt(media) {
     const s = media.segs[0];
     if (s.map) return 'mp4';
@@ -828,6 +861,7 @@
     }, sig);
 
     const sourceMuted = source.muted;
+    let stallCheck = 0;
     if (direct) {
       const startAt = source.currentTime;
       video.playbackRate = source.playbackRate || 1;
@@ -846,7 +880,7 @@
       };
       video.addEventListener('error', fallBack, sig);
       if (src.kind === 'hls' && hlsJs) {
-        hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1 });
+        hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined });
         let recovered = false;
         hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
         hls.on(HlsLib.Events.ERROR, (_, d) => {
@@ -863,6 +897,15 @@
         video.src = src.kind === 'hls' ? playableUrl(src) : src.url;
         play();
       }
+      // Watchdog: if our player never shows a frame (segments it can't decode, a server
+      // that refuses us), don't leave a black screen; hand back to the site's player.
+      const t0 = Date.now();
+      stallCheck = setInterval(() => {
+        if (!overlay || overlay.video !== video) return clearInterval(stallCheck);
+        if (video.readyState >= 2 && video.currentTime > 0) return clearInterval(stallCheck);
+        if (userPaused) return;
+        if (Date.now() - t0 > 12000) { clearInterval(stallCheck); fallBack(); }
+      }, 1000);
     } else if (opts.notice) {
       play(); // our player gave up; get the site's copy going again
     } else {
@@ -1085,6 +1128,7 @@
           video.load();
         }
         clearInterval(swapCheck);
+        clearInterval(stallCheck);
         clearTimeout(hudTimer); clearTimeout(bubbleTimer); clearTimeout(tapTimer);
         if (g) clearTimeout(g.hold);
         hostEl.remove();
