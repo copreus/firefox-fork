@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.1.0
+// @version      0.2.0
 // @description  Floating video toolbar plus a fullscreen gesture player: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
 // @grant        none
@@ -80,8 +80,9 @@
   // When a site (or our button) fullscreens a bare <video>, there is nowhere to draw an
   // overlay. We redirect video fullscreen requests to the video's parent instead and
   // stretch the video to fill it.
-  const HOST_CLASS = 'vg-fs-host';
-  const ACTIVE_ATTR = 'data-vg-active';
+  const ACTIVE_ATTR = 'data-vg-active'; // the video we are controlling
+  const FS_ATTR = 'data-vg-fs';         // the fullscreen element, while our player is mounted
+  const PATH_ATTR = 'data-vg-path';     // elements between the fullscreen element and the video
   const ElementProto = W.Element.prototype;
   const origRequestFs = ElementProto.requestFullscreen || ElementProto.mozRequestFullScreen;
 
@@ -94,7 +95,6 @@
     const host = video.parentElement;
     markActive(video);
     if (!host || !origRequestFs) return Promise.reject(new Error('fullscreen unavailable'));
-    host.classList.add(HOST_CLASS);
     const r = origRequestFs.call(host, { navigationUI: 'hide' });
     return r && typeof r.then === 'function' ? r : Promise.resolve();
   }
@@ -119,14 +119,33 @@
     }
   } catch (_) { /* page refused the patch; site-fullscreened containers still work */ }
 
+  // While our player is mounted, everything inside the fullscreen element except the
+  // video (and the elements that contain it) is hidden: the site's controls, title bars,
+  // gradients, spinners, captions and ads all disappear. The video is pinned full screen.
   const PAGE_CSS = `
-    .${HOST_CLASS}:fullscreen { background: #000 !important; }
-    .${HOST_CLASS}:fullscreen video[${ACTIVE_ATTR}] {
-      position: absolute !important; inset: 0 !important; margin: 0 !important;
-      width: 100% !important; height: 100% !important;
-      max-width: none !important; max-height: none !important;
-      object-fit: contain !important; transform: none !important;
-    }`;
+    [${FS_ATTR}] { background: #000 !important; }
+    [${FS_ATTR}] *:not([${PATH_ATTR}]):not(video[${ACTIVE_ATTR}]):not([data-video-gestures]) {
+      visibility: hidden !important;
+    }
+    [${FS_ATTR}]::before, [${FS_ATTR}]::after,
+    [${PATH_ATTR}]::before, [${PATH_ATTR}]::after { visibility: hidden !important; }
+    [${PATH_ATTR}] {
+      visibility: visible !important; opacity: 1 !important;
+      background: transparent !important; box-shadow: none !important; border-color: transparent !important;
+      transform: none !important; filter: none !important; backdrop-filter: none !important;
+      clip-path: none !important; mask: none !important; contain: none !important;
+      perspective: none !important; will-change: auto !important;
+    }
+    [${FS_ATTR}] video[${ACTIVE_ATTR}] {
+      position: fixed !important; inset: 0 !important; margin: 0 !important; padding: 0 !important;
+      width: 100vw !important; height: 100vh !important;
+      max-width: none !important; max-height: none !important; min-width: 0 !important; min-height: 0 !important;
+      object-fit: contain !important; object-position: center !important;
+      transform: none !important; filter: none !important; clip-path: none !important;
+      visibility: visible !important; opacity: 1 !important; background: #000 !important;
+      z-index: 2147483646 !important;
+    }
+    [${FS_ATTR}] > [data-video-gestures] { position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; }`;
 
   function injectPageCss() {
     const s = document.createElement('style');
@@ -320,11 +339,18 @@
     .knob { position: absolute; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; background: #fff; }`;
 
   let overlay = null;
+  let floatingBar = null;
   let brightness = 1; // remembered between fullscreen sessions on this page
 
   function mountOverlay(container, video) {
     if (overlay && overlay.container === container && overlay.video === video) return;
     teardownOverlay();
+
+    // Mark the fullscreen element and the chain of elements leading to the video,
+    // so PAGE_CSS can hide everything else.
+    markActive(video);
+    container.setAttribute(FS_ATTR, '');
+    for (let el = video.parentElement; el && el !== container; el = el.parentElement) el.setAttribute(PATH_ATTR, '');
 
     const ac = new AbortController();
     const sig = { signal: ac.signal };
@@ -544,10 +570,19 @@
     lockOrientation();
     video.addEventListener('loadedmetadata', lockOrientation, sig);
 
+    // Some sites swap the <video> element (ad -> show, quality change). Follow the playing one.
+    const swapCheck = setInterval(() => {
+      if (!video.isConnected || video.paused) {
+        const next = pickVideo([...container.querySelectorAll('video')].filter((v) => !v.paused));
+        if (next && next !== video) mountOverlay(container, next);
+      }
+    }, 1000);
+
     overlay = {
       container, video,
       destroy() {
         ac.abort();
+        clearInterval(swapCheck);
         clearTimeout(hudTimer); clearTimeout(bubbleTimer); clearTimeout(tapTimer);
         if (g) clearTimeout(g.hold);
         hostEl.remove();
@@ -560,13 +595,14 @@
     if (!overlay) return;
     overlay.destroy();
     overlay = null;
-    for (const el of document.querySelectorAll(`.${HOST_CLASS}`)) el.classList.remove(HOST_CLASS);
+    for (const el of document.querySelectorAll(`[${FS_ATTR}]`)) el.removeAttribute(FS_ATTR);
+    for (const el of document.querySelectorAll(`[${PATH_ATTR}]`)) el.removeAttribute(PATH_ATTR);
     for (const v of document.querySelectorAll(`video[${ACTIVE_ATTR}]`)) v.removeAttribute(ACTIVE_ATTR);
   }
 
   function onFullscreenChange() {
     const el = fsEl();
-    if (!el) { teardownOverlay(); return; }
+    if (!el) { teardownOverlay(); if (floatingBar) floatingBar.place(); return; }
     if (el.tagName === 'VIDEO') return; // bare video fullscreen (e.g. browser's own controls): no room for an overlay
     const video = el.querySelector(`video[${ACTIVE_ATTR}]`) || pickVideo(el.querySelectorAll('video'));
     if (video) mountOverlay(el, video);
@@ -577,7 +613,7 @@
     injectPageCss();
     document.addEventListener('fullscreenchange', onFullscreenChange);
     document.addEventListener('mozfullscreenchange', onFullscreenChange);
-    createBar();
+    floatingBar = createBar();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
