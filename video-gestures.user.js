@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.4.0
+// @version      0.5.0
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
 // @grant        none
@@ -18,6 +19,12 @@
   const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   if (W.__videoGesturesLoaded) return;
   W.__videoGesturesLoaded = true;
+
+  // hls.js comes in through @require. Keep our copy and take it back off the page's window
+  // so the site never sees (or picks up) a second hls.js.
+  const HlsLib = W.Hls || (typeof Hls !== 'undefined' ? Hls : null); // eslint-disable-line no-undef
+  if (HlsLib && W.Hls === HlsLib) { try { delete W.Hls; } catch (_) {} }
+  const canNativeHls = () => !!document.createElement('video').canPlayType('application/vnd.apple.mpegurl');
 
   // ------------------------------------------------------------------ config
   const MIN_W = 160;            // smallest video that gets the floating bar
@@ -103,6 +110,7 @@
   function exitFullscreen() {
     const f = origExitFs.exitFullscreen || origExitFs.mozCancelFullScreen;
     if (f && fsEl()) f.call(document);
+    else if (W.parent !== W) W.parent.postMessage({ __videoGestures: 'exit' }, '*'); // fullscreen is our <iframe>
   }
 
   try {
@@ -147,7 +155,7 @@
       Object.defineProperty(DocProto, name, {
         configurable: true, writable: true,
         value: function () {
-          if (overlay) return name === 'exitFullscreen' ? Promise.resolve() : undefined; // page can't kick us out
+          if (overlay || fsFrame) return name === 'exitFullscreen' ? Promise.resolve() : undefined; // page can't kick us out
           return f.apply(this, arguments);
         },
       });
@@ -180,7 +188,7 @@
       visibility: visible !important; opacity: 1 !important; background: #000 !important;
       z-index: 2147483646 !important;
     }
-    [${FS_ATTR}] > [data-video-gestures] { position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; }`;
+    [${FS_ATTR}] > [data-video-gestures="overlay"] { position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; }`;
 
   function injectPageCss() {
     const s = document.createElement('style');
@@ -209,32 +217,379 @@
     return best;
   }
 
-  // ------------------------------------------------------------------ download
-  function findMediaUrl(video) {
-    const ok = (u) => u && !/^(blob|mediasource|data):/i.test(u);
-    if (ok(video.currentSrc)) return { url: video.currentSrc, kind: 'direct' };
-    if (ok(video.src)) return { url: video.src, kind: 'direct' };
-    for (const s of video.querySelectorAll('source')) if (ok(s.src)) return { url: s.src, kind: 'direct' };
-    const urls = performance.getEntriesByType('resource').map((e) => e.name).reverse();
-    const hls = urls.find((u) => /\.m3u8(\?|#|$)/i.test(u));
-    if (hls) return { url: hls, kind: 'HLS playlist' };
-    const dash = urls.find((u) => /\.mpd(\?|#|$)/i.test(u));
-    if (dash) return { url: dash, kind: 'DASH manifest' };
+  // ------------------------------------------------------------------ finding the real source
+  // Streamed videos play from a blob: URL, so the <video> doesn't say where the stream is.
+  // Like a network sniffer, we watch every XHR/fetch the page makes and keep anything whose
+  // *content* is an HLS playlist (#EXTM3U) or DASH manifest, whatever its URL looks like.
+  const manifests = []; // { url, text, kind: 'hls-master' | 'hls-media' | 'dash', duration }
+  const rangedFiles = []; // video files the page's player is pulling in byte ranges
+  const MAX_MANIFEST = 5e6;
+  const decoder = new TextDecoder();
+  const absUrl = (u, base) => { try { return new URL(u, base || location.href).href; } catch (_) { return u; } };
+  const looksManifest = (head) => /^﻿?\s*(#EXTM3U|<\?xml|<MPD[\s>])/i.test(head);
+
+  function classifyManifest(text) {
+    const t = text.replace(/^﻿/, '').trimStart();
+    if (t.startsWith('#EXTM3U')) {
+      if (/#EXT-X-STREAM-INF/i.test(t)) return 'hls-master';
+      if (/#EXTINF/i.test(t)) return 'hls-media';
+      return null;
+    }
+    if (/<MPD[\s>]/i.test(t.slice(0, 4096))) return 'dash';
     return null;
   }
 
-  async function download(video, toast) {
-    const found = findMediaUrl(video);
-    if (!found) return toast("Can't find a downloadable file — this video is streamed in pieces.");
-    if (found.kind === 'direct') {
-      W.open(found.url, '_blank');
-      return toast('Opened video file — long-press it to save.');
+  function recordManifest(url, text) {
+    const kind = classifyManifest(text);
+    if (!kind || !url) return;
+    url = absUrl(url);
+    let duration = NaN;
+    if (kind === 'hls-media') {
+      duration = 0;
+      for (const m of text.matchAll(/#EXTINF:\s*([\d.]+)/gi)) duration += +m[1];
+      if (!/#EXT-X-ENDLIST/i.test(text)) duration = Infinity;
     }
+    const i = manifests.findIndex((m) => m.url === url);
+    if (i >= 0) manifests.splice(i, 1);
+    manifests.push({ url, text, kind, duration });
+    if (manifests.length > 60) manifests.shift();
+  }
+
+  function recordRanged(url, type) {
+    if (!/^(video|audio)\//i.test(type || '') || /mp2t|mpegurl/i.test(type)) return;
+    url = absUrl(url);
+    if (!/^https?:/i.test(url) || rangedFiles.includes(url)) return;
+    rangedFiles.push(url);
+    if (rangedFiles.length > 20) rangedFiles.shift();
+  }
+
+  try { performance.setResourceTimingBufferSize(5000); } catch (_) {}
+
+  try {
+    const XP = W.XMLHttpRequest.prototype;
+    const origOpen = XP.open, origSend = XP.send;
+    const xhrUrl = new WeakMap();
+    function onXhrLoad() {
+      try {
+        const url = this.responseURL || xhrUrl.get(this);
+        const type = this.getResponseHeader('content-type') || '';
+        if (this.status === 206) return recordRanged(url, type);
+        if (/^(video|audio|image)\//i.test(type)) return;
+        const rt = this.responseType;
+        if (rt === '' || rt === 'text') {
+          const txt = this.responseText;
+          if (txt && txt.length < MAX_MANIFEST && looksManifest(txt.slice(0, 64))) recordManifest(url, txt);
+        } else if (rt === 'arraybuffer' && this.response && this.response.byteLength < MAX_MANIFEST) {
+          const u8 = new Uint8Array(this.response);
+          if (looksManifest(decoder.decode(u8.subarray(0, 64)))) recordManifest(url, decoder.decode(u8));
+        }
+      } catch (_) {}
+    }
+    XP.open = function open(method, url) {
+      try { xhrUrl.set(this, String(url)); } catch (_) {}
+      return origOpen.apply(this, arguments);
+    };
+    XP.send = function send() {
+      try { this.addEventListener('load', onXhrLoad); } catch (_) {}
+      return origSend.apply(this, arguments);
+    };
+  } catch (_) {}
+
+  const origFetch = W.fetch;
+  async function sniffResponse(res) {
+    if (!res || res.type === 'opaque' || !res.body) return;
+    const type = res.headers.get('content-type') || '';
+    if (res.status === 206) return recordRanged(res.url, type);
+    if (/^(video|audio|image)\//i.test(type)) return;
+    if (+res.headers.get('content-length') > MAX_MANIFEST) return;
+    const reader = res.clone().body.getReader();
+    const first = await reader.read();
+    if (first.done || !looksManifest(decoder.decode(first.value.subarray(0, 64)))) { reader.cancel().catch(() => {}); return; }
+    const chunks = [first.value];
+    let size = first.value.length;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      if ((size += value.length) > MAX_MANIFEST) { reader.cancel().catch(() => {}); return; }
+    }
+    const all = new Uint8Array(size);
+    let o = 0;
+    for (const c of chunks) { all.set(c, o); o += c.length; }
+    recordManifest(res.url, decoder.decode(all));
+  }
+  if (typeof origFetch === 'function') {
+    W.fetch = function fetch() {
+      const p = origFetch.apply(this, arguments);
+      // Runs before the page's own .then(), so the body is cloned before the page reads it.
+      try { p.then((res) => sniffResponse(res).catch(() => {}), () => {}); } catch (_) {}
+      return p;
+    };
+  }
+
+  function hlsVariantUrls(m) {
+    const out = [];
+    const lines = m.text.split(/\r?\n/).map((l) => l.trim());
+    lines.forEach((l, i) => {
+      if (/^#EXT-X-STREAM-INF/i.test(l)) {
+        let j = i + 1;
+        while (j < lines.length && (!lines[j] || lines[j].startsWith('#'))) j++;
+        if (j < lines.length) out.push(absUrl(lines[j], m.url));
+      }
+      const uri = /^#EXT-X-MEDIA:.*URI="([^"]+)"/i.exec(l);
+      if (uri) out.push(absUrl(uri[1], m.url));
+    });
+    return out;
+  }
+
+  // Which of the playlists the page loaded belongs to this video? Prefer one whose length
+  // matches the video (so a pre-roll ad's playlist loses), then the newest master playlist.
+  function pickManifest(video) {
+    const masters = manifests.filter((m) => m.kind === 'hls-master');
+    const medias = manifests.filter((m) => m.kind === 'hls-media');
+    const d = video.duration;
+    if (isFinite(d) && d > 0) {
+      const match = medias.slice().reverse().find((m) => Math.abs(m.duration - d) < Math.max(2, d * 0.01));
+      if (match) return masters.slice().reverse().find((ms) => hlsVariantUrls(ms).includes(match.url)) || match;
+    }
+    return masters[masters.length - 1] || medias[medias.length - 1] ||
+      manifests.filter((m) => m.kind === 'dash').pop() || null;
+  }
+
+  const urlKind = (u) => (/\.m3u8?(\?|#|$)/i.test(u) ? 'hls' : /\.mpd(\?|#|$)/i.test(u) ? 'dash' : 'file');
+
+  // -> { kind: 'file' | 'hls' | 'dash', url, text? } or null
+  function findSource(video) {
+    const ok = (u) => u && /^https?:/i.test(u);
+    const srcs = [video.currentSrc, video.src, ...[...video.querySelectorAll('source')].map((s) => s.src)];
+    for (const u of srcs) {
+      if (!ok(u)) continue;
+      const kind = urlKind(u);
+      const known = manifests.find((m) => m.url === u);
+      return { kind: known ? (known.kind === 'dash' ? 'dash' : 'hls') : kind, url: u, text: known && known.text };
+    }
+    const m = pickManifest(video);
+    if (m) return { kind: m.kind === 'dash' ? 'dash' : 'hls', url: m.url, text: m.text };
+    if (rangedFiles.length) return { kind: 'file', url: rangedFiles[rangedFiles.length - 1] };
+    // Last resort: anything the page requested with a playlist-looking URL.
+    const urls = performance.getEntriesByType('resource').map((e) => e.name).reverse();
+    const hls = urls.find((u) => /m3u8/i.test(u));
+    if (hls) return { kind: 'hls', url: hls };
+    const dash = urls.find((u) => /\.mpd(\?|#|$)/i.test(u));
+    if (dash) return { kind: 'dash', url: dash };
+    return null;
+  }
+
+  // A playlist the page built in memory (blob:/data:) is re-created from the text we saw.
+  function playableUrl(src) {
+    if (/^https?:/i.test(src.url) || !src.text) return src.url;
+    return URL.createObjectURL(new Blob([src.text], { type: 'application/vnd.apple.mpegurl' }));
+  }
+
+  // ------------------------------------------------------------------ HLS download
+  // Fetches every segment of the best-quality stream (decrypting AES-128 if needed) and
+  // saves them as one .ts file (or .mp4 for fMP4 streams), which any video player opens.
+  function parseAttrs(s) {
+    const o = {};
+    for (const m of s.matchAll(/([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi)) o[m[1].toUpperCase()] = m[2].replace(/^"|"$/g, '');
+    return o;
+  }
+  const hlsLines = (text) => text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const afterColon = (l) => l.slice(l.indexOf(':') + 1);
+
+  function parseMaster(text, base) {
+    const variants = [], audio = [];
+    const lines = hlsLines(text);
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (/^#EXT-X-STREAM-INF:/i.test(l)) {
+        const a = parseAttrs(afterColon(l));
+        let j = i + 1;
+        while (j < lines.length && lines[j].startsWith('#')) j++;
+        if (j < lines.length) {
+          const [w, hgt] = (a.RESOLUTION || '0x0').split('x').map(Number);
+          variants.push({ url: absUrl(lines[j], base), bw: +a.BANDWIDTH || 0, px: w * hgt, height: hgt, audio: a.AUDIO });
+        }
+        i = j;
+      } else if (/^#EXT-X-MEDIA:/i.test(l)) {
+        const a = parseAttrs(afterColon(l));
+        if (a.TYPE === 'AUDIO' && a.URI) audio.push({ group: a['GROUP-ID'], url: absUrl(a.URI, base), def: a.DEFAULT === 'YES' });
+      }
+    }
+    variants.sort((x, y) => y.px - x.px || y.bw - x.bw);
+    return { variants, audio };
+  }
+
+  function parseRange(v, prevEnd) {
+    const [len, off] = v.split('@');
+    return { len: +len, off: off != null ? +off : prevEnd };
+  }
+
+  function parseMedia(text, base) {
+    let seq = 0, key = null, map = null, range = null, end = 0;
+    const segs = [];
+    for (const l of hlsLines(text)) {
+      if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(l)) seq = parseInt(afterColon(l), 10) || 0;
+      else if (/^#EXT-X-KEY:/i.test(l)) {
+        const a = parseAttrs(afterColon(l));
+        key = a.METHOD && a.METHOD !== 'NONE' ? { method: a.METHOD, url: a.URI && absUrl(a.URI, base), iv: a.IV } : null;
+      } else if (/^#EXT-X-MAP:/i.test(l)) {
+        const a = parseAttrs(afterColon(l));
+        map = { url: absUrl(a.URI, base), range: a.BYTERANGE ? parseRange(a.BYTERANGE, 0) : null };
+      } else if (/^#EXT-X-BYTERANGE:/i.test(l)) range = parseRange(afterColon(l), end);
+      else if (!l.startsWith('#')) {
+        segs.push({ url: absUrl(l, base), key, map, range, seq: seq + segs.length });
+        if (range) end = range.off + range.len;
+        range = null;
+      }
+    }
+    return { segs, live: !/#EXT-X-ENDLIST/i.test(text) };
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function fetchBytes(url, range) {
+    const opts = range ? { headers: { Range: `bytes=${range.off}-${range.off + range.len - 1}` } } : {};
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const r = await origFetch.call(W, url, opts);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return new Uint8Array(await r.arrayBuffer());
+      } catch (e) {
+        if (attempt >= 3) throw e;
+        await sleep(700 * (attempt + 1));
+      }
+    }
+  }
+  const fetchText = async (url) => {
+    const known = manifests.find((m) => m.url === url);
+    return known ? known.text : decoder.decode(await fetchBytes(url));
+  };
+
+  async function decryptSeg(data, key, seq, keys) {
+    if (!key) return data;
+    if (key.method !== 'AES-128') throw new Error(`encrypted with ${key.method} (DRM), can't save`);
+    if (!keys.has(key.url)) {
+      keys.set(key.url, fetchBytes(key.url).then((raw) => crypto.subtle.importKey('raw', raw, 'AES-CBC', false, ['decrypt'])));
+    }
+    const iv = new Uint8Array(16);
+    if (key.iv) {
+      const hex = key.iv.replace(/^0x/i, '').padStart(32, '0');
+      for (let i = 0; i < 16; i++) iv[i] = parseInt(hex.substr(i * 2, 2), 16);
+    } else {
+      new DataView(iv.buffer).setUint32(12, seq);
+    }
+    return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, await keys.get(key.url), data));
+  }
+
+  // Some sites disguise MPEG-TS segments as images by gluing junk in front. Skip to the
+  // first run of TS sync bytes.
+  function stripJunk(u8) {
+    if (u8[0] === 0x47) return u8;
+    const lim = Math.min(u8.length - 377, 65536);
+    for (let i = 0; i < lim; i++) if (u8[i] === 0x47 && u8[i + 188] === 0x47 && u8[i + 376] === 0x47) return u8.subarray(i);
+    return u8;
+  }
+
+  function segExt(media) {
+    const s = media.segs[0];
+    if (s.map) return 'mp4';
+    const e = (/\.([a-z0-9]{2,4})(\?|#|$)/i.exec(new URL(s.url).pathname) || [])[1];
+    return ['aac', 'mp3', 'ac3', 'ec3'].includes((e || '').toLowerCase()) ? e.toLowerCase() : 'ts';
+  }
+
+  async function grabMedia(media, job, label) {
+    const n = media.segs.length;
+    const parts = new Array(n);
+    const keys = new Map();
+    let next = 0, done = 0;
+    async function worker() {
+      while (next < n) {
+        if (job.cancelled) throw new Error('cancelled');
+        const i = next++;
+        const s = media.segs[i];
+        let b = await decryptSeg(await fetchBytes(s.url, s.range), s.key, s.seq, keys);
+        if (!s.map) b = stripJunk(b);
+        parts[i] = new Blob([b]);
+        job.progress(label, ++done, n);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(6, n) }, worker));
+    const map = media.segs[0].map;
+    if (map) parts.unshift(new Blob([await fetchBytes(map.url, map.range)]));
+    const ext = segExt(media);
+    return { blob: new Blob(parts, { type: ext === 'mp4' ? 'video/mp4' : 'video/mp2t' }), ext };
+  }
+
+  function saveBlob(blob, name) {
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = u;
+    a.download = name;
+    a.style.display = 'none';
+    a.addEventListener('click', (e) => e.stopImmediatePropagation());
+    document.documentElement.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 5 * 60 * 1000);
+  }
+
+  const fileName = () => ((document.title || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').trim().slice(0, 80) || 'video');
+
+  async function downloadHls(src, job) {
+    const text = src.text || await fetchText(src.url);
+    let mediaUrl = src.url, mediaText = text, audioUrl = null, quality = '';
+    if (/#EXT-X-STREAM-INF/i.test(text)) {
+      const m = parseMaster(text, src.url);
+      if (!m.variants.length) throw new Error('empty playlist');
+      const best = m.variants[0];
+      mediaUrl = best.url;
+      quality = best.height ? ` ${best.height}p` : '';
+      mediaText = await fetchText(mediaUrl);
+      if (best.audio) {
+        const group = m.audio.filter((a) => a.group === best.audio);
+        const a = group.find((x) => x.def) || group[0];
+        if (a) audioUrl = a.url;
+      }
+    }
+    const media = parseMedia(mediaText, mediaUrl);
+    if (!media.segs.length) throw new Error('empty playlist');
+    const name = fileName() + quality;
+    const v = await grabMedia(media, job, audioUrl ? 'video' : '');
+    saveBlob(v.blob, `${name}.${v.ext}`);
+    if (audioUrl) {
+      const a = await grabMedia(parseMedia(await fetchText(audioUrl), audioUrl), job, 'audio');
+      saveBlob(a.blob, `${name} (audio).${a.ext}`);
+      return { live: media.live, split: true };
+    }
+    return { live: media.live, split: false };
+  }
+
+  let dlJob = null;
+  async function download(video, toast) {
+    if (dlJob) { dlJob.cancelled = true; return; } // second tap cancels
+    const src = findSource(video);
+    if (!src) return toast("Couldn't find the video's source. Play it for a few seconds, then try again.");
+    if (src.kind === 'file') {
+      W.open(src.url, '_blank');
+      return toast('Opened the video file. Long-press it (or use ⋮) to save.');
+    }
+    if (src.kind === 'dash') {
+      try { await navigator.clipboard.writeText(src.url); toast('DASH stream: can\'t save it, manifest URL copied.'); } catch (_) { toast("DASH stream: can't save this one."); }
+      return;
+    }
+    const job = dlJob = {
+      cancelled: false,
+      progress: (label, d, n) => toast(`Downloading${label ? ` ${label}` : ''} ${Math.floor((d / n) * 100)}% (${d}/${n}). Tap ⬇ again to cancel.`, true),
+    };
+    toast('Reading the stream…', true);
     try {
-      await navigator.clipboard.writeText(found.url);
-      toast(`Streamed video: ${found.kind} URL copied.`);
-    } catch (_) {
-      toast(`Streamed video (${found.kind}) — can't download directly.`);
+      const r = await downloadHls(src, job);
+      toast(r.split ? 'Saved. This stream keeps audio separate, so you got two files: video and audio.'
+        : r.live ? 'Saved what this live stream has so far.' : 'Saved. Check your downloads.');
+    } catch (e) {
+      toast(job.cancelled ? 'Download cancelled.' : `Download failed: ${e.message || e}`);
+    } finally {
+      dlJob = null;
     }
   }
 
@@ -273,13 +628,21 @@
 
     let video = null;
     const dismissed = new WeakSet();
+    // Toasts live in their own host so they stay visible while the bar is hidden.
+    const toastHost = h('div', { 'data-video-gestures': 'toast' });
+    toastHost.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;';
+    const toastRoot = toastHost.attachShadow({ mode: 'closed' });
+    const toastStyle = document.createElement('style');
+    toastStyle.textContent = BAR_CSS;
     const toastEl = h('div', { class: 'toast' });
+    toastRoot.append(toastStyle, toastEl);
     let toastTimer = 0;
-    const toast = (msg) => {
+    const toast = (msg, sticky) => {
+      if (!toastHost.isConnected) document.documentElement.append(toastHost);
       toastEl.textContent = msg;
       toastEl.classList.add('show');
       clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2600);
+      if (!sticky) toastTimer = setTimeout(() => toastEl.classList.remove('show'), 4000);
     };
 
     const speedBtn = h('button', { title: 'Playback speed', onclick: () => {
@@ -298,14 +661,14 @@
     } }, icon(ICON.close, 18));
 
     const bar = h('div', { class: 'bar' }, speedBtn, dlBtn, fsBtn, closeBtn);
-    root.append(style, bar, toastEl);
+    root.append(style, bar);
     for (const t of ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'touchstart', 'touchend']) {
       hostEl.addEventListener(t, (e) => e.stopPropagation());
     }
 
     function place() {
       if (!hostEl.isConnected) document.documentElement.append(hostEl);
-      video = fsEl() ? null : pickVideo(document.getElementsByTagName('video'), { minSize: true, skip: dismissed });
+      video = fsEl() || overlay ? null : pickVideo(document.getElementsByTagName('video'), { minSize: true, skip: dismissed });
       if (!video) { hostEl.style.display = 'none'; return; }
       hostEl.style.display = 'block';
       speedBtn.textContent = `${video.playbackRate}×`;
@@ -357,6 +720,7 @@
     .shade { position: absolute; inset: 0; background: linear-gradient(rgba(0,0,0,.55), transparent 22%, transparent 70%, rgba(0,0,0,.65)); }
     .top { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 8px;
            padding: max(10px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 10px max(12px, env(safe-area-inset-left)); }
+    .tag { flex: none; padding: 4px 8px; border-radius: 999px; background: rgba(255,255,255,.18); font-size: 11px; font-weight: 600; white-space: nowrap; }
     .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 15px; }
     .mid { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; align-items: center; gap: 36px; }
     .bottom { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 12px;
@@ -382,14 +746,15 @@
     if (overlay && overlay.container === container && overlay.source === source) return;
     teardownOverlay();
 
-    // Direct mode: if the site's video is a plain file, play that file in our own <video>
-    // inside a closed shadow root. Page scripts have no way to reach it, so they can't
-    // pause it, seek it or swap its source. The site's video is paused and muted underneath.
-    const found = opts.noDirect ? null : findMediaUrl(source);
-    const direct = !!(found && found.kind === 'direct');
-    const video = direct
-      ? h('video', { class: 'own', src: found.url, playsinline: '', preload: 'auto' })
-      : source;
+    // Own-player mode: play the video's real source (a plain file, or the HLS playlist the
+    // page loaded) in our own <video> inside a closed shadow root. Page scripts have no way
+    // to reach it, so they can't pause it, seek it, starve its buffer or swap its source.
+    // The site's video is paused and muted underneath.
+    const src = opts.noDirect ? null : findSource(source);
+    const hlsJs = !!(HlsLib && HlsLib.isSupported && HlsLib.isSupported());
+    const direct = !!src && (src.kind === 'file' || (src.kind === 'hls' && (hlsJs || canNativeHls())));
+    const video = direct ? h('video', { class: 'own', playsinline: '', preload: 'auto' }) : source;
+    let hls = null;
 
     container.setAttribute(FS_ATTR, '');
     if (!direct) {
@@ -420,6 +785,9 @@
     const ripR = h('div', { class: 'ripple right' });
 
     const title = h('div', { class: 'title' }, document.title || '');
+    const modeTag = h('span', { class: 'tag', title: direct ? 'Playing the source in our own player: the page can\'t stop it'
+      : 'Using the site\'s player (pauses from the page are blocked)' },
+      direct ? (src.kind === 'hls' ? 'Own player · HLS' : 'Own player · file') : 'Site player');
     const speedBtn = h('button', { title: 'Speed' }, '1×');
     const rotateBtn = h('button', { title: 'Rotate screen' }, icon(ICON.rotate));
     const exitBtn = h('button', { title: 'Exit fullscreen' }, icon(ICON.exitFs));
@@ -434,7 +802,7 @@
     const track = h('div', { class: 'track' }, h('div', { class: 'rail' }, buf, fill, knob));
     const hud = h('div', { class: 'hud' },
       h('div', { class: 'shade' }),
-      h('div', { class: 'top' }, title, speedBtn, rotateBtn, exitBtn),
+      h('div', { class: 'top' }, title, modeTag, speedBtn, rotateBtn, exitBtn),
       h('div', { class: 'mid' }, backBtn, playBtn, fwdBtn),
       h('div', { class: 'bottom' }, cur, track, dur));
 
@@ -443,7 +811,7 @@
 
     // If page code yanks our overlay out while still fullscreen, put it back.
     const reattach = new MutationObserver(() => {
-      if (!hostEl.isConnected && fsEl() === container) container.append(hostEl);
+      if (!hostEl.isConnected && overlay && overlay.container === container) container.append(hostEl);
     });
     reattach.observe(container, { childList: true });
 
@@ -459,28 +827,44 @@
       }, 0);
     }, sig);
 
-    let sourceMuted = source.muted;
+    const sourceMuted = source.muted;
     if (direct) {
       const startAt = source.currentTime;
       video.playbackRate = source.playbackRate || 1;
       video.volume = source.volume;
       video.muted = source.muted;
-      video.addEventListener('loadedmetadata', () => {
-        if (startAt > 0 && (!isFinite(video.duration) || startAt < video.duration)) video.currentTime = startAt;
-      }, { once: true, signal: ac.signal });
       // Silence the site's copy and keep it stopped, however hard the page tries.
       source.muted = true;
       realPause(source);
       source.addEventListener('play', () => { source.muted = true; realPause(source); }, sig);
-      // If the file won't load in our player (e.g. a link that only works inside the site's
-      // player), fall back to guarding the site's own video.
-      video.addEventListener('error', () => {
+      // If the source won't load in our player (e.g. a link that only works inside the
+      // site's player), fall back to guarding the site's own video.
+      const fallBack = () => {
         if (!overlay || overlay.video !== video) return;
         teardownOverlay();
-        source.muted = sourceMuted;
-        mountOverlay(container, source, { noDirect: true });
-      }, sig);
-      play();
+        mountOverlay(container, source, { noDirect: true, notice: "Couldn't load the stream in our player" });
+      };
+      video.addEventListener('error', fallBack, sig);
+      if (src.kind === 'hls' && hlsJs) {
+        hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1 });
+        let recovered = false;
+        hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
+        hls.on(HlsLib.Events.ERROR, (_, d) => {
+          if (!d.fatal) return;
+          if (d.type === HlsLib.ErrorTypes.MEDIA_ERROR && !recovered) { recovered = true; hls.recoverMediaError(); return; }
+          fallBack();
+        });
+        hls.loadSource(playableUrl(src));
+        hls.attachMedia(video);
+      } else {
+        video.addEventListener('loadedmetadata', () => {
+          if (startAt > 0 && (!isFinite(video.duration) || startAt < video.duration)) video.currentTime = startAt;
+        }, { once: true, signal: ac.signal });
+        video.src = src.kind === 'hls' ? playableUrl(src) : src.url;
+        play();
+      }
+    } else if (opts.notice) {
+      play(); // our player gave up; get the site's copy going again
     } else {
       userPaused = video.paused;
     }
@@ -507,7 +891,7 @@
       if (opts.level != null) meterFill.style.width = `${Math.round(opts.level * 100)}%`;
       bubble.classList.add('show');
       clearTimeout(bubbleTimer);
-      if (!opts.sticky) bubbleTimer = setTimeout(() => bubble.classList.remove('show'), 700);
+      if (!opts.sticky) bubbleTimer = setTimeout(() => bubble.classList.remove('show'), opts.ms || 700);
     }
     const hideBubbleSoon = () => { clearTimeout(bubbleTimer); bubbleTimer = setTimeout(() => bubble.classList.remove('show'), 500); };
 
@@ -540,7 +924,8 @@
     video.addEventListener('pause', showHud, sig);
     render();
     showHud();
-    if (direct) showBubble(null, 'Playing the video file directly');
+    if (direct) showBubble(null, src.kind === 'hls' ? 'Playing the stream in our own player' : 'Playing the video file in our own player', { ms: 2000 });
+    else if (opts.notice) showBubble(null, opts.notice, { sub: "using the site's player", ms: 3000 });
 
     const togglePlay = () => { if (video.paused) play(); else pause(); };
     function skip(sec) {
@@ -695,6 +1080,7 @@
           try { if (video.currentTime > 0) source.currentTime = video.currentTime; } catch (_) {}
           source.muted = sourceMuted;
           realPause(video);
+          if (hls) hls.destroy();
           video.removeAttribute('src');
           video.load();
         }
@@ -716,13 +1102,33 @@
     for (const v of document.querySelectorAll(`video[${ACTIVE_ATTR}]`)) v.removeAttribute(ACTIVE_ATTR);
   }
 
+  // When the page fullscreens an <iframe> (embedded players), the video lives in that
+  // frame, where this script also runs. Tell it to take over its whole page.
+  let fsFrame = null;
+  const tellFrame = (frame, on) => { try { frame.contentWindow.postMessage({ __videoGestures: 'frame-fs', on }, '*'); } catch (_) {} };
+
   function onFullscreenChange() {
     const el = fsEl();
+    if (fsFrame && fsFrame !== el) { tellFrame(fsFrame, false); fsFrame = null; }
     if (!el) { teardownOverlay(); if (floatingBar) floatingBar.place(); return; }
     if (el.tagName === 'VIDEO') return; // bare video fullscreen (e.g. browser's own controls): no room for an overlay
+    if (el.tagName === 'IFRAME') { fsFrame = el; tellFrame(el, true); return; }
     const video = el.querySelector(`video[${ACTIVE_ATTR}]`) || pickVideo(el.querySelectorAll('video'));
     if (video) mountOverlay(el, video);
   }
+
+  W.addEventListener('message', (e) => {
+    const d = e.data;
+    if (!d || typeof d !== 'object' || !d.__videoGestures) return;
+    if (d.__videoGestures === 'frame-fs' && e.source === W.parent) {
+      if (!d.on) { if (!fsEl()) teardownOverlay(); return; }
+      const video = document.querySelector(`video[${ACTIVE_ATTR}]`) || pickVideo(document.getElementsByTagName('video'));
+      if (video && !fsEl()) mountOverlay(document.documentElement, video);
+    } else if (d.__videoGestures === 'exit' && fsFrame && e.source === fsFrame.contentWindow) {
+      const f = origExitFs.exitFullscreen || origExitFs.mozCancelFullScreen;
+      if (f) f.call(document);
+    }
+  });
 
   // ------------------------------------------------------------------ boot
   function init() {

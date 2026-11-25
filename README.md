@@ -12,11 +12,21 @@ Tampermonkey checks that link for updates automatically.
 ## What it does
 **Floating bar** under the main video on any page: speed · download · fullscreen · hide.
 
-**Fullscreen player the page can't stop.** When the site's video is a plain file (an .mp4 link, etc.),
-fullscreen plays that file in the script's own video element, sealed away from the page. The page's
-scripts can't pause, seek or swap it, and can't kick you out of fullscreen. The site's copy is paused and
-muted underneath, and when you leave fullscreen it picks up where you stopped. If the site streams in
-pieces (no single file), the script keeps the site's video but ignores any pause that didn't come from you.
+**Fullscreen player the page can't stop.** In fullscreen the script plays the video's real source in
+its own player, sealed away from the page, so the site's scripts can't pause it, cut off its stream or
+kick you out of fullscreen. The site's copy is paused and muted underneath, and when you leave fullscreen
+it picks up where you stopped.
+- Works with plain files (.mp4 etc.) and **HLS streams** (`.m3u8` playlists, via hls.js), including
+  playlists hidden behind URLs that don't end in `.m3u8`. The script spots them by their content as
+  the page loads them, the way a network sniffer does.
+- A tag in the top bar shows which player you're on: **Own player · HLS**, **Own player · file**, or
+  **Site player** (it couldn't find or load the source, so it's protecting the site's video instead,
+  blocking pauses but unable to stop the site from cutting its own stream).
+- Also works when the page fullscreens an embedded player `<iframe>`.
+
+**Download** (⬇ on the floating bar): plain files open for saving. HLS streams are downloaded
+segment by segment at the best quality, decrypted if they use AES-128, and saved as one `.ts` (or
+`.mp4`) file that VLC, MX Player etc. play. Progress shows at the bottom; tap ⬇ again to cancel.
 
 **Fullscreen gestures**
 | Gesture | Action |
@@ -37,4 +47,7 @@ The top bar has speed, **rotate** (switch between landscape and portrait) and ex
 - If a page fullscreens the bare `<video>` through Firefox's built-in controls, there's no room for the overlay. The script redirects the sites' own fullscreen calls, so this mostly only affects Firefox's native video controls.
 - If the direct file won't play outside the site's player (some links expire or check where they're
   played from), the script falls back to the site's own video, still with pause-blocking.
-- Download only works for plain video files. Streamed video (HLS/DASH, most big sites) can't be saved directly; the script copies the playlist URL instead.
+- DASH streams (`.mpd`) can't be played in the own player or downloaded; the script copies the manifest URL. DRM-protected video (Netflix etc.) can't be either.
+- Streams that keep audio as a separate track download as two files (video + audio).
+- An HLS download is held in memory until it's saved, so very long, high-quality videos can be too big for a phone.
+- Play the video for a few seconds before downloading or fullscreening, so the script sees the playlist load.
