@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.2
+// @version      0.5.3
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -484,11 +484,24 @@
   // Some sites disguise MPEG-TS segments as images by gluing junk in front. Skip to the
   // first run of TS sync bytes.
   function stripJunk(u8) {
-    if (u8[0] === 0x47) return u8;
-    const lim = Math.min(u8.length - 377, 65536);
-    for (let i = 0; i < lim; i++) if (u8[i] === 0x47 && u8[i + 188] === 0x47 && u8[i + 376] === 0x47) return u8.subarray(i);
+    if (u8[0] === 0x47 && (u8.length < 189 || u8[188] === 0x47)) return u8;
+    const sync = (i) => u8[i] === 0x47 && u8[i + 188] === 0x47 && u8[i + 376] === 0x47;
+    // A real PNG in front: walk its chunks to the end of IEND, the TS data starts there.
+    if (u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) {
+      let o = 8;
+      while (o + 12 <= u8.length) {
+        const len = ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]) >>> 0;
+        const type = String.fromCharCode(u8[o + 4], u8[o + 5], u8[o + 6], u8[o + 7]);
+        o += 12 + len;
+        if (type === 'IEND') break;
+      }
+      for (let i = o; i < Math.min(u8.length - 376, o + 1024); i++) if (sync(i)) return u8.subarray(i);
+    }
+    // Anything else: scan the whole segment for the first run of TS sync bytes.
+    for (let i = 0; i < u8.length - 376; i++) if (sync(i)) return u8.subarray(i);
     return u8;
   }
+
 
   // hls.js fragment loader that runs stripJunk on each segment, so disguised streams play
   // in our player too. Skipped for encrypted segments (strip after decrypting isn't possible
@@ -739,7 +752,7 @@
       opacity: 0; transition: opacity .15s; pointer-events: none;
     }
     .bubble.show { opacity: 1; }
-    .bubble .sub { opacity: .75; font-weight: 500; font-size: 14px; }
+    .bubble .sub { opacity: .75; font-weight: 500; font-size: 14px; white-space: normal; max-width: 70vw; overflow-wrap: anywhere; }
     .meter { width: 120px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.3); overflow: hidden; }
     .meter > i { display: block; height: 100%; background: #fff; width: 0; }
     .ripple { position: absolute; top: 0; bottom: 0; width: 38%; display: flex; align-items: center; justify-content: center;
@@ -865,6 +878,7 @@
     const sourceMuted = source.muted;
     let stallCheck = 0;
     let lastErr = '';
+    const errLog = [];
     let firstFrame = false;
     if (direct) {
       const startAt = source.currentTime;
@@ -892,7 +906,10 @@
         hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
         hls.on(HlsLib.Events.ERROR, (_, d) => {
           const code = d.response && d.response.code;
-          lastErr = `${d.details}${code ? ` (HTTP ${code})` : ''}`;
+          const msg = d.error && d.error.message ? `: ${String(d.error.message).slice(0, 140)}` : d.reason ? `: ${d.reason}` : '';
+          const e = `${d.details}${code ? ` (HTTP ${code})` : ''}${msg}`;
+          if (!errLog.includes(e)) errLog.push(e);
+          lastErr = errLog.slice(-3).join(' → ');
           if (!firstFrame) showBubble(null, 'Loading stream…', { sub: lastErr, sticky: true });
           if (!d.fatal) return;
           if (d.type === HlsLib.ErrorTypes.MEDIA_ERROR && !recovered) { recovered = true; hls.recoverMediaError(); return; }
