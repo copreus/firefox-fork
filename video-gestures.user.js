@@ -9,8 +9,8 @@
 // @run-at       document-start
 // @sandbox      JavaScript
 // @inject-into  page
-// @updateURL    https://raw.githubusercontent.com/copreus/firefox-fork/ccr-01175c86-4gdter/video-gestures.user.js
-// @downloadURL  https://raw.githubusercontent.com/copreus/firefox-fork/ccr-01175c86-4gdter/video-gestures.user.js
+// @updateURL    https://raw.githubusercontent.com/copreus/firefox-fork/ccr-4461f63e-19zvzq/video-gestures.user.js
+// @downloadURL  https://raw.githubusercontent.com/copreus/firefox-fork/ccr-4461f63e-19zvzq/video-gestures.user.js
 // ==/UserScript==
 
 (function () {

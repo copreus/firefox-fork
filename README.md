@@ -5,7 +5,7 @@ A Quetta/Aloha-style video experience for Firefox for Android, as a Tampermonkey
 ## Install
 1. In Firefox for Android, install **Tampermonkey** (or Violentmonkey) from addons.mozilla.org.
 2. Open this link and tap **Install**:
-   https://raw.githubusercontent.com/copreus/firefox-fork/ccr-01175c86-4gdter/video-gestures.user.js
+   https://raw.githubusercontent.com/copreus/firefox-fork/ccr-4461f63e-19zvzq/video-gestures.user.js
 
 Tampermonkey checks that link for updates automatically.
 
