@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.4
+// @version      0.5.5
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -27,7 +27,12 @@
   // Running in Firefox's content-script sandbox (the manager couldn't inject into the page)?
   // Then hls.js's worker messages arrive as page objects that hls.js can't write to, so it
   // fails with "Not allowed to define cross-origin object as property". Run it without the worker.
-  const sandboxed = W !== window;
+  // (Some managers set unsafeWindow === window even there, so ask Firefox directly: only a
+  // sandboxed script sees wrappedJSObject / XPCNativeWrapper.)
+  const sandboxed = (() => {
+    try { return W !== window || typeof window.wrappedJSObject !== 'undefined' || typeof XPCNativeWrapper !== 'undefined'; } // eslint-disable-line no-undef
+    catch (_) { return true; }
+  })();
   const canNativeHls = () => !!document.createElement('video').canPlayType('application/vnd.apple.mpegurl');
 
   // ------------------------------------------------------------------ config
@@ -907,22 +912,33 @@
         fallBack(e ? `media error ${e.code}${e.message ? `: ${e.message}` : ''}` : 'media error');
       }, sig);
       if (src.kind === 'hls' && hlsJs) {
-        hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined, enableWorker: !sandboxed });
         let recovered = false;
-        hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
-        hls.on(HlsLib.Events.ERROR, (_, d) => {
-          const code = d.response && d.response.code;
-          const msg = d.error && d.error.message ? `: ${String(d.error.message).slice(0, 140)}` : d.reason ? `: ${d.reason}` : '';
-          const e = `${d.details}${code ? ` (HTTP ${code})` : ''}${msg}`;
-          if (!errLog.includes(e)) errLog.push(e);
-          lastErr = errLog.slice(-3).join(' → ');
-          if (!firstFrame) showBubble(null, 'Loading stream…', { sub: lastErr, sticky: true });
-          if (!d.fatal) return;
-          if (d.type === HlsLib.ErrorTypes.MEDIA_ERROR && !recovered) { recovered = true; hls.recoverMediaError(); return; }
-          fallBack(lastErr);
-        });
-        hls.loadSource(playableUrl(src));
-        hls.attachMedia(video);
+        let noWorkerRetry = false;
+        const startHls = (worker) => {
+          hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined, enableWorker: worker });
+          hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
+          hls.on(HlsLib.Events.ERROR, (_, d) => {
+            const code = d.response && d.response.code;
+            const raw = d.error && d.error.message ? String(d.error.message) : d.reason ? String(d.reason) : '';
+            // Firefox sandbox trouble from hls.js's worker: start over without the worker, once.
+            if (worker && !noWorkerRetry && /Xray|cross-origin object/i.test(raw)) {
+              noWorkerRetry = true;
+              const h0 = hls;
+              setTimeout(() => { try { h0.destroy(); } catch (_) {} if (overlay && overlay.video === video) startHls(false); }, 0);
+              return;
+            }
+            const e = `${d.details}${d.event ? ` in ${d.event}` : ''}${code ? ` (HTTP ${code})` : ''}${raw ? `: ${raw.slice(0, 140)}` : ''}`;
+            if (!errLog.includes(e)) errLog.push(e);
+            lastErr = errLog.slice(-3).join(' → ');
+            if (!firstFrame) showBubble(null, 'Loading stream…', { sub: `${lastErr}${worker ? '' : ' [no worker]'}`, sticky: true });
+            if (!d.fatal) return;
+            if (d.type === HlsLib.ErrorTypes.MEDIA_ERROR && !recovered) { recovered = true; hls.recoverMediaError(); return; }
+            fallBack(lastErr);
+          });
+          hls.loadSource(playableUrl(src));
+          hls.attachMedia(video);
+        };
+        startHls(!sandboxed);
       } else {
         video.addEventListener('loadedmetadata', () => {
           if (startAt > 0 && (!isFinite(video.duration) || startAt < video.duration)) video.currentTime = startAt;
