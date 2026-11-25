@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.1
+// @version      0.5.2
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -753,6 +753,7 @@
     .shade { position: absolute; inset: 0; background: linear-gradient(rgba(0,0,0,.55), transparent 22%, transparent 70%, rgba(0,0,0,.65)); }
     .top { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; gap: 8px;
            padding: max(10px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 10px max(12px, env(safe-area-inset-left)); }
+    button.tag { min-width: 0; height: 30px; padding: 0 12px; font-size: 12px; }
     .tag { flex: none; padding: 4px 8px; border-radius: 999px; background: rgba(255,255,255,.18); font-size: 11px; font-weight: 600; white-space: nowrap; }
     .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 15px; }
     .mid { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; align-items: center; gap: 36px; }
@@ -818,8 +819,8 @@
     const ripR = h('div', { class: 'ripple right' });
 
     const title = h('div', { class: 'title' }, document.title || '');
-    const modeTag = h('span', { class: 'tag', title: direct ? 'Playing the source in our own player: the page can\'t stop it'
-      : 'Using the site\'s player (pauses from the page are blocked)' },
+    const modeTag = h('button', { class: 'tag', title: direct ? 'Our own player. Tap to switch to the site\'s player'
+      : 'The site\'s player. Tap to try our own player' },
       direct ? (src.kind === 'hls' ? 'Own player · HLS' : 'Own player · file') : 'Site player');
     const speedBtn = h('button', { title: 'Speed' }, '1×');
     const rotateBtn = h('button', { title: 'Rotate screen' }, icon(ICON.rotate));
@@ -849,8 +850,9 @@
     reattach.observe(container, { childList: true });
 
     let userPaused = false;
-    const play = () => { userPaused = false; return realPlay(video).catch(() => { userPaused = true; }); };
-    const pause = () => { userPaused = true; realPause(video); };
+    let userTappedPause = false; // only the user's own pause, not a refused play()
+    const play = () => { userPaused = false; userTappedPause = false; return realPlay(video).catch(() => { userPaused = true; }); };
+    const pause = () => { userPaused = true; userTappedPause = true; realPause(video); };
 
     // Whatever pauses the video (page code, a site player holding the real pause(), a
     // focus/visibility handler), resume it unless it was the user.
@@ -862,6 +864,8 @@
 
     const sourceMuted = source.muted;
     let stallCheck = 0;
+    let lastErr = '';
+    let firstFrame = false;
     if (direct) {
       const startAt = source.currentTime;
       video.playbackRate = source.playbackRate || 1;
@@ -873,20 +877,26 @@
       source.addEventListener('play', () => { source.muted = true; realPause(source); }, sig);
       // If the source won't load in our player (e.g. a link that only works inside the
       // site's player), fall back to guarding the site's own video.
-      const fallBack = () => {
+      const fallBack = (why) => {
         if (!overlay || overlay.video !== video) return;
         teardownOverlay();
-        mountOverlay(container, source, { noDirect: true, notice: "Couldn't load the stream in our player" });
+        mountOverlay(container, source, { noDirect: true, notice: "Couldn't play the stream in our player", why: why || lastErr });
       };
-      video.addEventListener('error', fallBack, sig);
+      video.addEventListener('error', () => {
+        const e = video.error;
+        fallBack(e ? `media error ${e.code}${e.message ? `: ${e.message}` : ''}` : 'media error');
+      }, sig);
       if (src.kind === 'hls' && hlsJs) {
         hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined });
         let recovered = false;
         hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
         hls.on(HlsLib.Events.ERROR, (_, d) => {
+          const code = d.response && d.response.code;
+          lastErr = `${d.details}${code ? ` (HTTP ${code})` : ''}`;
+          if (!firstFrame) showBubble(null, 'Loading stream…', { sub: lastErr, sticky: true });
           if (!d.fatal) return;
           if (d.type === HlsLib.ErrorTypes.MEDIA_ERROR && !recovered) { recovered = true; hls.recoverMediaError(); return; }
-          fallBack();
+          fallBack(lastErr);
         });
         hls.loadSource(playableUrl(src));
         hls.attachMedia(video);
@@ -902,9 +912,14 @@
       const t0 = Date.now();
       stallCheck = setInterval(() => {
         if (!overlay || overlay.video !== video) return clearInterval(stallCheck);
-        if (video.readyState >= 2 && video.currentTime > 0) return clearInterval(stallCheck);
-        if (userPaused) return;
-        if (Date.now() - t0 > 12000) { clearInterval(stallCheck); fallBack(); }
+        if (video.readyState >= 2 && video.currentTime > startAt) {
+          firstFrame = true;
+          bubble.classList.remove('show');
+          return clearInterval(stallCheck);
+        }
+        if (userTappedPause) return;
+        if (video.paused) realPlay(video).catch(() => {}); // a refused/aborted play() mustn't leave us stuck
+        if (Date.now() - t0 > 8000) { clearInterval(stallCheck); fallBack(lastErr || `no picture after 8s (state ${video.readyState})`); }
       }, 1000);
     } else if (opts.notice) {
       play(); // our player gave up; get the site's copy going again
@@ -967,8 +982,14 @@
     video.addEventListener('pause', showHud, sig);
     render();
     showHud();
-    if (direct) showBubble(null, src.kind === 'hls' ? 'Playing the stream in our own player' : 'Playing the video file in our own player', { ms: 2000 });
-    else if (opts.notice) showBubble(null, opts.notice, { sub: "using the site's player", ms: 3000 });
+    if (direct) showBubble(null, 'Loading stream…', { sub: 'tap the tag at the top to use the site\'s player', sticky: true });
+    else if (opts.notice) showBubble(null, opts.notice, { sub: opts.why ? `${opts.why} · using the site's player` : "using the site's player", ms: opts.why ? 6000 : 3000 });
+
+    modeTag.addEventListener('click', () => {
+      teardownOverlay();
+      if (direct) mountOverlay(container, source, { noDirect: true, notice: "Switched to the site's player" });
+      else mountOverlay(container, source);
+    }, sig);
 
     const togglePlay = () => { if (video.paused) play(); else pause(); };
     function skip(sec) {
