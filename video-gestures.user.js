@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.6
+// @version      0.5.7
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -830,7 +830,12 @@
     // The site's video is paused and muted underneath.
     const src = opts.noDirect ? null : findSource(source);
     const hlsJs = !!(HlsLib && HlsLib.isSupported && HlsLib.isSupported());
-    const direct = !!src && (src.kind === 'file' || (src.kind === 'hls' && (hlsJs || canNativeHls())));
+    // In Firefox's content-script sandbox hls.js mixes page and sandbox objects and Firefox
+    // blocks it (black screen), so there HLS goes to the site's player unless Firefox plays it natively.
+    const hlsBlocked = !!src && src.kind === 'hls' && sandboxed && !canNativeHls();
+    const direct = !!src && (src.kind === 'file' || (src.kind === 'hls' && !hlsBlocked && (hlsJs || canNativeHls())));
+    if (hlsBlocked && !opts.notice) opts = Object.assign({}, opts, {
+      notice: "Own player can't run here", why: 'Firefox sandboxed the script (page CSP)' });
     const video = direct ? h('video', { class: 'own', playsinline: '', preload: 'auto' }) : source;
     let hls = null;
 
