@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.2.0
-// @description  Floating video toolbar plus a fullscreen gesture player: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
+// @version      0.3.0
+// @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
 // @grant        none
 // @run-at       document-start
 // @sandbox      JavaScript
 // @inject-into  page
-// @updateURL    https://raw.githubusercontent.com/copreus/firefox-fork/ccr-4461f63e-19zvzq/video-gestures.user.js
-// @downloadURL  https://raw.githubusercontent.com/copreus/firefox-fork/ccr-4461f63e-19zvzq/video-gestures.user.js
+// @updateURL    https://raw.githubusercontent.com/copreus/firefox-fork/ccr-01175c86-4gdter/video-gestures.user.js
+// @downloadURL  https://raw.githubusercontent.com/copreus/firefox-fork/ccr-01175c86-4gdter/video-gestures.user.js
 // ==/UserScript==
 
 (function () {
@@ -100,7 +100,7 @@
   }
 
   function exitFullscreen() {
-    const f = document.exitFullscreen || document.mozCancelFullScreen;
+    const f = origExitFs.exitFullscreen || origExitFs.mozCancelFullScreen;
     if (f && fsEl()) f.call(document);
   }
 
@@ -118,6 +118,40 @@
       });
     }
   } catch (_) { /* page refused the patch; site-fullscreened containers still work */ }
+
+  // ------------------------------------------------------------------ play guard
+  // We run before the page's scripts, so we keep the real play/pause/exitFullscreen for
+  // ourselves and hand the page versions that do nothing while our player is mounted.
+  // Videos in `guarded` ignore pause() from page code; only our own calls get through.
+  const MediaProto = W.HTMLMediaElement.prototype;
+  const origPlay = MediaProto.play;
+  const origPause = MediaProto.pause;
+  const guarded = new WeakSet();
+  const realPlay = (v) => { try { return Promise.resolve(origPlay.call(v)); } catch (e) { return Promise.reject(e); } };
+  const realPause = (v) => origPause.call(v);
+  try {
+    Object.defineProperty(MediaProto, 'pause', {
+      configurable: true, writable: true,
+      value: function pause() { if (guarded.has(this)) return; return origPause.apply(this, arguments); },
+    });
+  } catch (_) {}
+
+  const DocProto = W.Document.prototype;
+  const origExitFs = {};
+  for (const name of ['exitFullscreen', 'mozCancelFullScreen']) {
+    const f = DocProto[name];
+    if (typeof f !== 'function') continue;
+    origExitFs[name] = f;
+    try {
+      Object.defineProperty(DocProto, name, {
+        configurable: true, writable: true,
+        value: function () {
+          if (overlay) return name === 'exitFullscreen' ? Promise.resolve() : undefined; // page can't kick us out
+          return f.apply(this, arguments);
+        },
+      });
+    } catch (_) {}
+  }
 
   // While our player is mounted, everything inside the fullscreen element except the
   // video (and the elements that contain it) is hidden: the site's controls, title bars,
@@ -298,6 +332,7 @@
     :host { all: initial; }
     .wrap { position: absolute; inset: 0; font: 14px/1.2 system-ui, -apple-system, Roboto, sans-serif; color: #fff;
             user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+    .own { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
     .dim { position: absolute; inset: 0; background: #000; opacity: 0; pointer-events: none; }
     .layer { position: absolute; inset: 0; touch-action: none; }
     .bubble {
@@ -342,15 +377,26 @@
   let floatingBar = null;
   let brightness = 1; // remembered between fullscreen sessions on this page
 
-  function mountOverlay(container, video) {
-    if (overlay && overlay.container === container && overlay.video === video) return;
+  function mountOverlay(container, source, opts = {}) {
+    if (overlay && overlay.container === container && overlay.source === source) return;
     teardownOverlay();
 
-    // Mark the fullscreen element and the chain of elements leading to the video,
-    // so PAGE_CSS can hide everything else.
-    markActive(video);
+    // Direct mode: if the site's video is a plain file, play that file in our own <video>
+    // inside a closed shadow root. Page scripts have no way to reach it, so they can't
+    // pause it, seek it or swap its source. The site's video is paused and muted underneath.
+    const found = opts.noDirect ? null : findMediaUrl(source);
+    const direct = !!(found && found.kind === 'direct');
+    const video = direct
+      ? h('video', { class: 'own', src: found.url, playsinline: '', preload: 'auto' })
+      : source;
+
     container.setAttribute(FS_ATTR, '');
-    for (let el = video.parentElement; el && el !== container; el = el.parentElement) el.setAttribute(PATH_ATTR, '');
+    if (!direct) {
+      // Mark the chain of elements leading to the site's video so PAGE_CSS hides everything else.
+      markActive(source);
+      for (let el = source.parentElement; el && el !== container; el = el.parentElement) el.setAttribute(PATH_ATTR, '');
+    }
+    guarded.add(video);
 
     const ac = new AbortController();
     const sig = { signal: ac.signal };
@@ -390,8 +436,52 @@
       h('div', { class: 'mid' }, backBtn, playBtn, fwdBtn),
       h('div', { class: 'bottom' }, cur, track, dur));
 
-    root.append(style, h('div', { class: 'wrap' }, dim, layer, ripL, ripR, hud, bubble));
+    root.append(style, h('div', { class: 'wrap' }, direct ? video : null, dim, layer, ripL, ripR, hud, bubble));
     container.append(hostEl);
+
+    // If page code yanks our overlay out while still fullscreen, put it back.
+    const reattach = new MutationObserver(() => {
+      if (!hostEl.isConnected && fsEl() === container) container.append(hostEl);
+    });
+    reattach.observe(container, { childList: true });
+
+    let userPaused = false;
+    const play = () => { userPaused = false; return realPlay(video).catch(() => { userPaused = true; }); };
+    const pause = () => { userPaused = true; realPause(video); };
+
+    // Whatever pauses the video (page code, a site player holding the real pause(), a
+    // focus/visibility handler), resume it unless it was the user.
+    video.addEventListener('pause', () => {
+      setTimeout(() => {
+        if (overlay && overlay.video === video && !userPaused && video.paused && !video.ended) realPlay(video).catch(() => {});
+      }, 0);
+    }, sig);
+
+    let sourceMuted = source.muted;
+    if (direct) {
+      const startAt = source.currentTime;
+      video.playbackRate = source.playbackRate || 1;
+      video.volume = source.volume;
+      video.muted = source.muted;
+      video.addEventListener('loadedmetadata', () => {
+        if (startAt > 0 && (!isFinite(video.duration) || startAt < video.duration)) video.currentTime = startAt;
+      }, { once: true, signal: ac.signal });
+      // Silence the site's copy and keep it stopped, however hard the page tries.
+      source.muted = true;
+      realPause(source);
+      source.addEventListener('play', () => { source.muted = true; realPause(source); }, sig);
+      // If the file won't load in our player (e.g. a link that only works inside the site's
+      // player), fall back to guarding the site's own video.
+      video.addEventListener('error', () => {
+        if (!overlay || overlay.video !== video) return;
+        teardownOverlay();
+        source.muted = sourceMuted;
+        mountOverlay(container, source, { noDirect: true });
+      }, sig);
+      play();
+    } else {
+      userPaused = video.paused;
+    }
 
     // Keep the site's own player from reacting to our touches.
     for (const t of ['click', 'dblclick', 'pointerdown', 'pointerup', 'pointermove', 'mousedown', 'mouseup', 'mousemove', 'touchstart', 'touchend', 'touchmove', 'contextmenu']) {
@@ -448,8 +538,9 @@
     video.addEventListener('pause', showHud, sig);
     render();
     showHud();
+    if (direct) showBubble(null, 'Playing the video file directly');
 
-    const togglePlay = () => { if (video.paused) video.play().catch(() => {}); else video.pause(); };
+    const togglePlay = () => { if (video.paused) play(); else pause(); };
     function skip(sec) {
       const d = duration();
       video.currentTime = clamp(video.currentTime + sec, 0, isFinite(d) ? d : video.currentTime + Math.abs(sec));
@@ -571,17 +662,28 @@
     video.addEventListener('loadedmetadata', lockOrientation, sig);
 
     // Some sites swap the <video> element (ad -> show, quality change). Follow the playing one.
-    const swapCheck = setInterval(() => {
-      if (!video.isConnected || video.paused) {
+    // (Not needed in direct mode: our own video never gets swapped.)
+    const swapCheck = direct ? 0 : setInterval(() => {
+      if (!video.isConnected || (video.paused && userPaused)) {
         const next = pickVideo([...container.querySelectorAll('video')].filter((v) => !v.paused));
         if (next && next !== video) mountOverlay(container, next);
       }
     }, 1000);
 
     overlay = {
-      container, video,
+      container, video, source,
       destroy() {
         ac.abort();
+        reattach.disconnect();
+        guarded.delete(video);
+        if (direct) {
+          // Hand the position back to the site's player and stop our copy.
+          try { if (video.currentTime > 0) source.currentTime = video.currentTime; } catch (_) {}
+          source.muted = sourceMuted;
+          realPause(video);
+          video.removeAttribute('src');
+          video.load();
+        }
         clearInterval(swapCheck);
         clearTimeout(hudTimer); clearTimeout(bubbleTimer); clearTimeout(tapTimer);
         if (g) clearTimeout(g.hold);
