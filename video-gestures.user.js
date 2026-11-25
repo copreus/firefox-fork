@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Gestures
 // @namespace    https://github.com/copreus/firefox-fork
-// @version      0.5.5
+// @version      0.5.6
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js
 // @description  Floating video toolbar plus a fullscreen gesture player the page can't pause: drag to seek, left side for brightness, right side for volume, double-tap to skip, hold for 2x.
 // @match        *://*/*
@@ -512,14 +512,30 @@
   }
 
 
-  // hls.js fragment loader that runs stripJunk on each segment, so disguised streams play
-  // in our player too. Skipped for encrypted segments (strip after decrypting isn't possible
-  // here) and for fMP4 (no TS sync bytes to look for).
-  let JunkStripLoader = null;
-  function junkStripLoader() {
-    if (JunkStripLoader || !HlsLib) return JunkStripLoader;
+  // In Firefox's content-script sandbox, what XHR hands back can be the *page's* ArrayBuffer.
+  // hls.js then dies on it ("Permission denied to access property 'constructor'"). Copy it
+  // into a buffer of our own realm, checking each way actually gives a usable buffer.
+  const usable = (b) => { try { return b instanceof ArrayBuffer && new Uint8Array(b).subarray(0, 1) && true; } catch (_) { return false; } };
+  function toLocalBuffer(d) {
+    if (usable(d)) return d;
+    const tries = [
+      () => { const c = new Uint8Array(d.byteLength); c.set(new Uint8Array(d)); return c.buffer; },
+      () => structuredClone(d),
+      () => { const src = new Uint8Array(d); const n = src.length; const c = new Uint8Array(n); for (let i = 0; i < n; i++) c[i] = src[i]; return c.buffer; },
+    ];
+    for (const t of tries) { try { const r = t(); if (usable(r)) return r; } catch (_) {} }
+    return d;
+  }
+
+  // hls.js loader that makes every response buffer our own (see above) and, for media
+  // segments, runs stripJunk so disguised streams play. Stripping is skipped for encrypted
+  // segments (can't strip before decrypting) and fMP4 (no TS sync bytes to look for).
+  const hlsLoaders = {};
+  function hlsLoader(strip) {
+    const k = strip ? 'f' : 'p';
+    if (hlsLoaders[k] || !HlsLib) return hlsLoaders[k];
     const Base = HlsLib.DefaultConfig.loader;
-    JunkStripLoader = class extends Base {
+    return (hlsLoaders[k] = class extends Base {
       load(context, config, callbacks) {
         const onSuccess = callbacks.onSuccess;
         const frag = context.frag;
@@ -528,21 +544,25 @@
         super.load(context, config, Object.assign({}, callbacks, {
           onSuccess(response, stats, ctx, details) {
             try {
-              if (!encrypted && !init && response.data instanceof ArrayBuffer) {
-                const u8 = new Uint8Array(response.data);
-                const box = u8.length > 8 ? String.fromCharCode(u8[4], u8[5], u8[6], u8[7]) : '';
-                if (!/^(ftyp|styp|moof|sidx|emsg)$/.test(box)) {
-                  const s = stripJunk(u8);
-                  if (s !== u8) response.data = s.slice().buffer;
+              const d = response.data;
+              if (d && typeof d === 'object') {
+                let buf = toLocalBuffer(d);
+                if (strip && !encrypted && !init && usable(buf)) {
+                  const u8 = new Uint8Array(buf);
+                  const box = u8.length > 8 ? String.fromCharCode(u8[4], u8[5], u8[6], u8[7]) : '';
+                  if (!/^(ftyp|styp|moof|sidx|emsg)$/.test(box)) {
+                    const st = stripJunk(u8);
+                    if (st !== u8) buf = st.slice().buffer;
+                  }
                 }
+                if (buf !== d) response.data = buf;
               }
             } catch (_) {}
             onSuccess(response, stats, ctx, details);
           },
         }));
       }
-    };
-    return JunkStripLoader;
+    });
   }
 
   function segExt(media) {
@@ -915,7 +935,7 @@
         let recovered = false;
         let noWorkerRetry = false;
         const startHls = (worker) => {
-          hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, fLoader: junkStripLoader() || undefined, enableWorker: worker });
+          hls = new HlsLib({ startPosition: startAt > 0 ? startAt : -1, loader: hlsLoader(false) || undefined, fLoader: hlsLoader(true) || undefined, enableWorker: worker });
           hls.on(HlsLib.Events.MANIFEST_PARSED, () => play());
           hls.on(HlsLib.Events.ERROR, (_, d) => {
             const code = d.response && d.response.code;
@@ -927,7 +947,12 @@
               setTimeout(() => { try { h0.destroy(); } catch (_) {} if (overlay && overlay.video === video) startHls(false); }, 0);
               return;
             }
-            const e = `${d.details}${d.event ? ` in ${d.event}` : ''}${code ? ` (HTTP ${code})` : ''}${raw ? `: ${raw.slice(0, 140)}` : ''}`;
+            let where = '';
+            try { // first stack frame, so a screenshot shows which line failed
+              const f = String((d.error && d.error.stack) || '').split('\n').find((l) => /:\d+:\d+/.test(l));
+              if (f) where = ` @ ${(/([^/@\s]+:\d+:\d+)\)?\s*$/.exec(f) || [])[1] || ''}`;
+            } catch (_) {}
+            const e = `${d.details}${d.event ? ` in ${d.event}` : ''}${code ? ` (HTTP ${code})` : ''}${raw ? `: ${raw.slice(0, 140)}` : ''}${where}`;
             if (!errLog.includes(e)) errLog.push(e);
             lastErr = errLog.slice(-3).join(' → ');
             if (!firstFrame) showBubble(null, 'Loading stream…', { sub: `${lastErr}${worker ? '' : ' [no worker]'}`, sticky: true });
